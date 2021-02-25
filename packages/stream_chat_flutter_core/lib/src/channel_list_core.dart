@@ -205,31 +205,18 @@ class _ChannelListCoreState extends State<ChannelListCore>
 
     WidgetsBinding.instance.addObserver(this);
 
-    final channelsBloc = ChannelsBloc.of(context);
-    channelsBloc.queryChannels(
-      filter: widget.filter,
-      sortOptions: widget.sort,
-      paginationParams: widget.pagination,
-      options: widget.options,
-    );
+    loadData();
 
     final client = StreamChatCore.of(context).client;
 
     _subscription = client
         .on(
-      EventType.connectionRecovered,
-      EventType.notificationAddedToChannel,
-      EventType.notificationMessageNew,
-      EventType.channelVisible,
-    )
-        .listen((event) {
-      channelsBloc.queryChannels(
-        filter: widget.filter,
-        sortOptions: widget.sort,
-        paginationParams: widget.pagination,
-        options: widget.options,
-      );
-    });
+          EventType.connectionRecovered,
+          EventType.notificationAddedToChannel,
+          EventType.notificationMessageNew,
+          EventType.channelVisible,
+        )
+        .listen((event) => loadData());
 
     if (widget.channelListController != null) {
       widget.channelListController.loadData = loadData;

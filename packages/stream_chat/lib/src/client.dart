@@ -9,6 +9,7 @@ import 'package:rxdart/rxdart.dart';
 import 'package:stream_chat/src/api/retry_policy.dart';
 import 'package:stream_chat/src/event_type.dart';
 import 'package:stream_chat/src/models/attachment_file.dart';
+import 'package:stream_chat/src/models/channel_model.dart';
 import 'package:stream_chat/src/models/own_user.dart';
 import 'package:stream_chat/version.dart';
 import 'package:uuid/uuid.dart';
@@ -492,7 +493,7 @@ class StreamChatClient {
           'cid': {
             '\$in': state.channels.keys.toList(),
           },
-        }).then(
+        }).last.then(
           (_) async {
             await resync();
             handleEvent(Event(
@@ -577,15 +578,15 @@ class StreamChatClient {
   final _queryChannelsStreams = <String, Future<List<Channel>>>{};
 
   /// Requests channels with a given query.
-  Future<List<Channel>> queryChannels({
+  Stream<List<Channel>> queryChannels({
     Map<String, dynamic> filter,
-    List<SortOption> sort,
+    List<SortOption<ChannelModel>> sort,
     Map<String, dynamic> options,
     PaginationParams paginationParams = const PaginationParams(limit: 10),
     int messageLimit,
-    bool onlyOffline = false,
+    bool preferOffline = true,
     bool waitForConnect = true,
-  }) async {
+  }) async* {
     if (waitForConnect) {
       if (_connectCompleter != null && !_connectCompleter.isCompleted) {
         logger.info('awaiting connection completer');
@@ -597,42 +598,52 @@ class StreamChatClient {
         if (persistenceEnabled) {
           logger.warning(
               '$errorMessage\nTrying to retrieve channels from the offline storage.');
-          onlyOffline = true;
+          preferOffline = true;
         } else {
           throw Exception(errorMessage);
         }
       }
     }
 
-    final hash = base64.encode(utf8.encode(
-        '$filter${_asMap(sort)}$options${paginationParams?.toJson()}$messageLimit$onlyOffline'));
-    if (_queryChannelsStreams.containsKey(hash)) {
-      return _queryChannelsStreams[hash];
-    }
+    final hash = base64.encode(
+      utf8.encode(
+          '$filter${_asMap(sort)}$options${paginationParams?.toJson()}$messageLimit$preferOffline'),
+    );
 
-    final newQueryChannelsStream = _doQueryChannels(
+    // if (_queryChannelsStreams.containsKey(hash)) {
+    //   yield await _queryChannelsStreams[hash];
+    // } else {
+    // if (true) {
+    //   final channels = await _queryChannelsOffline(
+    //     filter: filter,
+    //     sort: sort,
+    //     paginationParams: paginationParams,
+    //   );
+    //   if (channels.isNotEmpty) yield channels;
+    // }
+
+    yield await _doQueryChannels(
       filter: filter,
       sort: sort,
       options: options,
       paginationParams: paginationParams,
       messageLimit: messageLimit,
-      onlyOffline: onlyOffline,
-    ).whenComplete(() {
-      _queryChannelsStreams.remove(hash);
-    });
+    );
 
-    _queryChannelsStreams[hash] = newQueryChannelsStream;
+    // yield await newQueryChannelsFuture;
 
-    return newQueryChannelsStream;
+    // _queryChannelsStreams[hash] = newQueryChannelsFuture;
+    //
+    // yield await newQueryChannelsFuture;
+    // }
   }
 
   Future<List<Channel>> _doQueryChannels({
     @required Map<String, dynamic> filter,
-    @required List<SortOption> sort,
+    @required List<SortOption<ChannelModel>> sort,
     @required Map<String, dynamic> options,
     @required int messageLimit,
     PaginationParams paginationParams = const PaginationParams(limit: 10),
-    bool onlyOffline = false,
   }) async {
     logger.info('Query channel start');
     final defaultOptions = {
@@ -660,83 +671,64 @@ class StreamChatClient {
       payload.addAll(paginationParams.toJson());
     }
 
-    if (onlyOffline) {
-      return _queryChannelsOffline(
-        filter: filter,
-        sort: sort,
-        paginationParams: paginationParams,
-      );
+    final response = await get(
+      '/channels',
+      queryParameters: {
+        'payload': jsonEncode(payload),
+      },
+    );
+
+    final res = decode<QueryChannelsResponse>(
+      response.data,
+      QueryChannelsResponse.fromJson,
+    );
+
+    final users = res.channels
+        ?.expand((channel) => channel.members.map((member) => member.user))
+        ?.toList();
+
+    if (users != null) {
+      state._updateUsers(users);
     }
 
-    try {
-      final response = await get(
-        '/channels',
-        queryParameters: {
-          'payload': jsonEncode(payload),
-        },
-      );
+    logger.info('Got ${res.channels?.length} channels from api');
 
-      final res = decode<QueryChannelsResponse>(
-        response.data,
-        QueryChannelsResponse.fromJson,
-      );
-
-      final users = res.channels
-          ?.expand((channel) => channel.members.map((member) => member.user))
-          ?.toList();
-
-      if (users != null) {
-        state._updateUsers(users);
-      }
-
-      logger.info('Got ${res.channels?.length} channels from api');
-
-      if (res.channels?.isEmpty != false &&
-          (paginationParams?.offset ?? 0) == 0) {
-        logger.warning('''We could not find any channel for this query.
+    if (res.channels?.isEmpty != false &&
+        (paginationParams?.offset ?? 0) == 0) {
+      logger.warning('''We could not find any channel for this query.
           Please make sure to take a look at the Flutter tutorial: https://getstream.io/chat/flutter/tutorial
           If your application already has users and channels, you might need to adjust your query channel as explained in the docs https://getstream.io/chat/docs/query_channels/?language=dart''');
-      }
+    }
 
-      final newChannels = Map<String, Channel>.from(state.channels ?? {});
-      final channels = <Channel>[];
+    final newChannels = Map<String, Channel>.from(state.channels ?? {});
+    final channels = <Channel>[];
 
-      if (res.channels != null) {
-        for (final channelState in res.channels) {
-          final channel = newChannels[channelState.channel.cid];
-          if (channel != null) {
-            channel.state?.updateChannelState(channelState);
-            channels.add(channel);
-          } else {
-            final newChannel = Channel.fromState(this, channelState);
-            await chatPersistenceClient
-                ?.updateChannelState(newChannel.state.channelState);
-            newChannel.state?.updateChannelState(channelState);
-            newChannels[newChannel.cid] = newChannel;
-            channels.add(newChannel);
-          }
+    if (res.channels != null) {
+      for (final channelState in res.channels) {
+        final channel = newChannels[channelState.channel.cid];
+        if (channel != null) {
+          channel.state?.updateChannelState(channelState);
+          channels.add(channel);
+        } else {
+          final newChannel = Channel.fromState(this, channelState);
+          await chatPersistenceClient
+              ?.updateChannelState(newChannel.state.channelState);
+          newChannel.state?.updateChannelState(channelState);
+          newChannels[newChannel.cid] = newChannel;
+          channels.add(newChannel);
         }
       }
-
-      state.channels = newChannels;
-
-      await chatPersistenceClient?.updateChannelQueries(
-        filter,
-        res.channels.map((c) => c.channel.cid).toList(),
-        paginationParams?.offset == null || paginationParams.offset == 0,
-      );
-
-      return channels;
-    } catch (e) {
-      if (!persistenceEnabled) {
-        rethrow;
-      }
-      return _queryChannelsOffline(
-        filter: filter,
-        sort: sort,
-        paginationParams: paginationParams,
-      );
     }
+
+    state.channels = newChannels;
+
+    await chatPersistenceClient?.updateChannelQueries(
+      filter,
+      res.channels.map((c) => c.channel.cid).toList(),
+      paginationParams?.offset == null || paginationParams.offset == 0,
+    );
+
+    return channels;
   }
 
   dynamic _parseError(DioError error) {
@@ -752,7 +744,7 @@ class StreamChatClient {
 
   Future<List<Channel>> _queryChannelsOffline({
     @required Map<String, dynamic> filter,
-    @required List<SortOption> sort,
+    @required List<SortOption<ChannelModel>> sort,
     PaginationParams paginationParams = const PaginationParams(limit: 10),
   }) async {
     final offlineChannels = await chatPersistenceClient?.getChannelStates(
